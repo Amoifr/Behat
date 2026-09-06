@@ -10,12 +10,15 @@
 
 namespace Behat\Behat\Tester\Cli;
 
+use Behat\Behat\EventDispatcher\Event\AfterFeatureSetup;
 use Behat\Behat\EventDispatcher\Event\AfterFeatureTested;
+use Behat\Behat\EventDispatcher\Event\AfterScenarioSetup;
 use Behat\Behat\EventDispatcher\Event\AfterScenarioTested;
 use Behat\Behat\EventDispatcher\Event\ExampleTested;
 use Behat\Behat\EventDispatcher\Event\FeatureTested;
 use Behat\Behat\EventDispatcher\Event\ScenarioTested;
 use Behat\Testwork\Cli\Controller;
+use Behat\Testwork\EventDispatcher\Event\AfterSuiteSetup;
 use Behat\Testwork\EventDispatcher\Event\AfterSuiteTested;
 use Behat\Testwork\EventDispatcher\Event\ExerciseCompleted;
 use Behat\Testwork\EventDispatcher\Event\SuiteTested;
@@ -46,6 +49,13 @@ final class RerunController implements Controller
      * @var array<string, list<string>>
      */
     private array $features = [];
+    /**
+     * Suites whose before-suite hook failed. Their features are only known once they have all been
+     * dispatched, so the re-run is queued when the suite ends.
+     *
+     * @var array<string, true>
+     */
+    private array $suitesWithFailedSetup = [];
 
     /**
      * Initializes controller.
@@ -82,6 +92,10 @@ final class RerunController implements Controller
 
     public function execute(InputInterface $input, OutputInterface $output): ?int
     {
+        $this->eventDispatcher->addListener(ScenarioTested::AFTER_SETUP, $this->collectFailedScenarioSetup(...), -50);
+        $this->eventDispatcher->addListener(ExampleTested::AFTER_SETUP, $this->collectFailedScenarioSetup(...), -50);
+        $this->eventDispatcher->addListener(FeatureTested::AFTER_SETUP, $this->collectFailedFeatureSetup(...), -50);
+        $this->eventDispatcher->addListener(SuiteTested::AFTER_SETUP, $this->collectFailedSuiteSetup(...), -50);
         $this->eventDispatcher->addListener(ScenarioTested::AFTER, $this->collectFailedScenario(...), -50);
         $this->eventDispatcher->addListener(ExampleTested::AFTER, $this->collectFailedScenario(...), -50);
         $this->eventDispatcher->addListener(FeatureTested::AFTER, $this->collectFailedFeature(...), -50);
@@ -107,6 +121,53 @@ final class RerunController implements Controller
         $input->setArgument('paths', [$this->getFileName()]);
 
         return null;
+    }
+
+    /**
+     * Records a scenario whose before-scenario hook failed.
+     *
+     * The scenario is then skipped rather than failed, so its result reports nothing wrong and
+     * `collectFailedScenario()` would let it through.
+     */
+    public function collectFailedScenarioSetup(AfterScenarioSetup $event): void
+    {
+        if (!$this->getFileName() || $event->getSetup()->isSuccessful()) {
+            return;
+        }
+
+        $this->addPath(
+            $event->getSuite()->getName(),
+            $event->getFeature()->getFile() . ':' . $event->getScenario()->getLine()
+        );
+    }
+
+    /**
+     * Records the whole feature if its before-feature hook failed.
+     *
+     * Every scenario of the feature is skipped in that case, so the feature is re-run as a whole.
+     */
+    public function collectFailedFeatureSetup(AfterFeatureSetup $event): void
+    {
+        if (!$this->getFileName() || $event->getSetup()->isSuccessful()) {
+            return;
+        }
+
+        $this->addPath($event->getSuite()->getName(), $event->getFeature()->getFile());
+    }
+
+    /**
+     * Remembers that a before-suite hook failed.
+     *
+     * The features of the suite are still dispatched, as skipped, so they are collected as usual
+     * and queued once the suite ends.
+     */
+    public function collectFailedSuiteSetup(AfterSuiteSetup $event): void
+    {
+        if (!$this->getFileName() || $event->getSetup()->isSuccessful()) {
+            return;
+        }
+
+        $this->suitesWithFailedSetup[$event->getSuite()->getName()] = true;
     }
 
     /**
@@ -159,7 +220,7 @@ final class RerunController implements Controller
     }
 
     /**
-     * Records every feature the suite ran if its after-suite hook failed.
+     * Records every feature of the suite if one of its suite-level hooks failed.
      *
      * The hook belongs to one suite, so only that suite is re-run, and the other ones are left
      * alone.
@@ -172,11 +233,15 @@ final class RerunController implements Controller
             return;
         }
 
-        if (!$this->getFileName() || $event->getTeardown()->isSuccessful()) {
+        if (!$this->getFileName()) {
             return;
         }
 
         $suitename = $event->getSuite()->getName();
+
+        if ($event->getTeardown()->isSuccessful() && !isset($this->suitesWithFailedSetup[$suitename])) {
+            return;
+        }
 
         foreach ($this->features[$suitename] ?? [] as $file) {
             $this->addPath($suitename, $file);
